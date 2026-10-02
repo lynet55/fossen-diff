@@ -4,6 +4,20 @@
 - Single file implementations of filters and stuff such as mppi
 
 
+Open rviz (from `fossen-diff/`). The `env -u` part is only needed in the VS Code snap terminal, where its GTK variables crash rviz2:
+
+```bash
+source /opt/ros/jazzy/setup.bash && env -u GTK_PATH -u GIO_MODULE_DIR -u GTK_EXE_PREFIX -u LOCPATH -u GSETTINGS_SCHEMA_DIR -u GTK_IM_MODULE_FILE rviz2 -d fossen.rviz
+```
+
+Run the closed-loop rollout (from `fossen-diff/`), or start both at once:
+
+```bash
+source /opt/ros/jazzy/setup.bash && export PYTHONPATH=/opt/ros/jazzy/lib/python3.12/site-packages && (env -u GTK_PATH -u GIO_MODULE_DIR -u GTK_EXE_PREFIX -u LOCPATH -u GSETTINGS_SCHEMA_DIR -u GTK_IM_MODULE_FILE rviz2 -d fossen.rviz &) && uv run python main.py
+```
+
+More details: [docs/implementation_details.md](docs/implementation_details.md)
+
 Desing decitions i made:
 
 - Prediciton model implemented in JAX for differentability, motivated by CBFs

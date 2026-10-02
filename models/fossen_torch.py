@@ -2,9 +2,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from run_learning_fossen_enhanced import Dataset, FossenNN
-from run_learning_PINN import PINN
-
 
 # Edit these values directly when running from the VS Code Run button.
 DATA_DIR = "data"
