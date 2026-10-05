@@ -17,22 +17,8 @@ shared dependency is the fossen model, which is imported.
 State x = [nu(6), pos(3), R(9 flattened)]  (18,)   body vel, NED pos, body->NED rot
 Control u = tau = [Fx, Fy, Fz, Tx, Ty, Tz]  (6,)
 
-ROS interface (topics come from SimEnvBTUUV's telemetry bridge, scripts/ros2_udp_telemetry_publisher.py):
-
-    in   /bluerov/odom             nav_msgs/Odometry      pose in `map` (Z-up), twist in WORLD frame
-    in   /bluerov/sonar/scan       sensor_msgs/LaserScan  256 planar rays, 360 deg, in bluerov_base_link
-    in   /bluerov/map              nav_msgs/OccupancyGrid sonar-built 2D map in `map` (Z-up), 0..100
-    in   /bluerov/goal             geometry_msgs/PoseStamped  goal in `map` (Z-up)
-    in   /fossen/nominal_cmd_vel   geometry_msgs/Twist    optional pilot/policy command, body FLU
-    out  /fossen/modified_input    geometry_msgs/WrenchStamped  tau = u0, body FRD (fossen convention)
-    out  /fossen/modified_cmd_vel  geometry_msgs/Twist    predicted body velocity after u0, body FLU;
-                                   MarineGym consumes this via scripts/ros2_cmd_vel_to_udp.py
-    out  /mppi_rollouts            visualization_msgs/Marker  LINE_LIST in `map` (Z-up), VIS_ROLLOUTS
-                                   sampled trajectories spread evenly over the cost ranking, colored by
-                                   MPPI weight: green = high weight (low cost), red = ~zero weight
-
-The sim is Z-up with a FLU body; fossen is NED with a FRD body. Both are mapped by
-F = diag(1, -1, -1):  p_ned = F p,  R_ned = F R F,  nu_frd = F nu_flu.
+I/O (ROS topics, RViz rollouts, MarineGym UDP action) lives in ros_io.py; this file only
+turns an ros_io.Observation into an ros_io.Command (tau, the velocity it produces, rollouts).
 
 Obstacles enter the cost twice: a clearance (distance) field computed from the occupancy
 grid on every map update (memory of walls out of view), plus raw sonar hits within
@@ -41,7 +27,7 @@ SCAN_RANGE (fresh, catches moving obstacles the decaying map blurs).
 Two cost modes, picked per tick: while a nominal command is fresh the MPPI tracks it
 (safety filter: pilot intent + sonar avoidance); otherwise it drives to /bluerov/goal.
 
-Run as a ROS node:  uv run python modifiers/vanilla_mppi.py
+Run as a ROS node:  uv run python modifiers/vanilla_mppi.py   (--mode test: one step, no ROS)
 """
 
 import os
@@ -53,6 +39,7 @@ import jax.numpy as jnp
 # Make `models` importable when this file is run directly (python modifiers/vanilla_mppi.py).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.fossen_diff import fossen_rollout
+import ros_io
 
 # --------------------------------------------------------------------------- #
 # Hyperparameters (edit these directly)
@@ -73,21 +60,8 @@ SONAR_RAYS = 256    # fixed sonar buffer size (padded/truncated) so mppi_step ne
 SAFE_DIST = 0.6     # [m] horizontal clearance below which obstacles are penalized
 SCAN_RANGE = 1.5    # [m] only sonar hits closer than this enter the cost; the grid covers the rest
 OCC_THRESHOLD = 45  # grid cells >= this (0..100) are occupied; matches the sim planner's 0.45
-NOMINAL_TIMEOUT = 0.5  # [s] nominal command older than this -> goal mode
-
-STATE_TOPIC = "/bluerov/odom"                 # in:  current state
-SONAR_TOPIC = "/bluerov/sonar/scan"           # in:  sonar ranges
-MAP_TOPIC = "/bluerov/map"                    # in:  occupancy grid
-GOAL_TOPIC = "/bluerov/goal"                  # in:  goal position
-NOMINAL_TOPIC = "/fossen/nominal_cmd_vel"     # in:  nominal velocity command (optional)
-CONTROL_TOPIC = "/fossen/modified_input"      # out: tau
-CMD_VEL_TOPIC = "/fossen/modified_cmd_vel"    # out: filtered velocity command for MarineGym
-ROLLOUTS_TOPIC = "/mppi_rollouts"             # out: sampled rollouts colored by weight (RViz)
-
 VIS_ROLLOUTS = 64     # rollouts drawn, picked evenly over the cost ranking (best to worst)
 VIS_LOG_RANGE = 20.0  # log-weight span (nats) mapped green -> red; weights below that are red
-
-FLIP = jnp.diag(jnp.array([1.0, -1.0, -1.0]))  # Z-up/FLU <-> NED/FRD
 
 
 # --------------------------------------------------------------------------- #
@@ -209,133 +183,40 @@ def make_ref(goal=None, nominal=None, obstacles=None, grid=None):
             NO_GRID if grid is None else grid)
 
 
-def run_node():
-    """Spin an MPPI controller node: subscribe to state/sonar/goal/nominal, publish control.
+class Controller:
+    """ros_io.Observation -> ros_io.Command. Holds the warm-started plan between ticks."""
 
-    Add a channel by adding a subscription that fills `inbox`, a line in the
-    state-packing below, or another publisher --- all local to this function.
-    """
-    import numpy as np
-    import rclpy
-    from geometry_msgs.msg import Point, PoseStamped, Twist, WrenchStamped
-    from nav_msgs.msg import OccupancyGrid, Odometry
-    from rclpy.executors import ExternalShutdownException
-    from scipy.spatial.transform import Rotation
-    from sensor_msgs.msg import LaserScan
-    from std_msgs.msg import ColorRGBA
-    from visualization_msgs.msg import Marker
+    def __init__(self):
+        import numpy as np
+        self.np = np
+        self.U = jnp.zeros((HORIZON, NU))
+        self.key = jax.random.key(0)
+        self.grid, self.grid_version = None, None
+        self.predict = jax.jit(dynamics)  # eager fossen_rollout re-traces its scan every call (~170 ms)
 
-    F = np.asarray(FLIP)
+    def __call__(self, obs):
+        np = self.np
+        if obs.grid is not None and obs.grid.version != self.grid_version:  # once per map update
+            self.grid = clearance_grid(obs.grid.occ, obs.grid.origin, obs.grid.res)
+            self.grid_version = obs.grid.version
 
-    rclpy.init()
-    node = rclpy.create_node("vanilla_mppi")
-    now = lambda: node.get_clock().now().nanoseconds * 1e-9
-
-    inbox = {"odom": None, "scan": None, "goal": None, "nominal": None, "nominal_t": -1e9, "grid": None}
-
-    def on_nominal(m):
-        inbox["nominal"], inbox["nominal_t"] = m, now()
-
-    node.create_subscription(Odometry, STATE_TOPIC, lambda m: inbox.__setitem__("odom", m), 10)
-    node.create_subscription(LaserScan, SONAR_TOPIC, lambda m: inbox.__setitem__("scan", m), 10)
-    node.create_subscription(PoseStamped, GOAL_TOPIC, lambda m: inbox.__setitem__("goal", m), 10)
-    def on_map(m):
-        # Clearance field once per map update, not per tick. Grid rows run along map y.
-        occ = np.asarray(m.data, np.int16).reshape(m.info.height, m.info.width)
-        origin = [m.info.origin.position.x, m.info.origin.position.y]
-        inbox["grid"] = clearance_grid(occ, origin, m.info.resolution)
-
-    node.create_subscription(Twist, NOMINAL_TOPIC, on_nominal, 10)
-    node.create_subscription(OccupancyGrid, MAP_TOPIC, on_map, 1)
-    control_pub = node.create_publisher(WrenchStamped, CONTROL_TOPIC, 10)
-    cmd_vel_pub = node.create_publisher(Twist, CMD_VEL_TOPIC, 10)
-    rollouts_pub = node.create_publisher(Marker, ROLLOUTS_TOPIC, 1)
-
-    def publish_rollouts(vis):
-        """LINE_LIST of the sampled rollouts in `map` (Z-up), per-vertex color from MPPI weight."""
-        positions, log_w = (np.asarray(a) for a in vis)
-        pts = positions @ F  # NED -> map (F is its own inverse and symmetric)
-        c = np.clip(1.0 + (log_w - log_w.max()) / VIS_LOG_RANGE, 0.0, 1.0)  # 1 = best, 0 = ~zero weight
-        m = Marker()
-        m.header.stamp = node.get_clock().now().to_msg()
-        m.header.frame_id = "map"
-        m.ns, m.id, m.type, m.action = "mppi_rollouts", 0, Marker.LINE_LIST, Marker.ADD
-        m.pose.orientation.w = 1.0
-        m.scale.x = 0.01
-        # Segment endpoints (a0, b0, a1, b1, ...), one color per endpoint. ~7 ms for 64 rollouts.
-        seg = np.stack([pts[:, :-1], pts[:, 1:]], axis=2).reshape(-1, 3).tolist()
-        m.points = [Point(x=x, y=y, z=z) for x, y, z in seg]
-        colors = [ColorRGBA(r=float(1.0 - ck), g=float(ck), b=0.0, a=float(0.15 + 0.85 * ck)) for ck in c]
-        m.colors = [colors[k] for k in range(len(c)) for _ in range(2 * (pts.shape[1] - 1))]
-        rollouts_pub.publish(m)
-
-    U = jnp.zeros((HORIZON, NU))
-    key = jax.random.key(0)
-    predict = jax.jit(dynamics)  # eager fossen_rollout re-traces its scan every call (~170 ms)
-
-    def on_timer():
-        nonlocal U, key
-        o = inbox["odom"]
-        if o is None:
-            return
-
-        # INPUT: state. Sim odom is Z-up map pose + WORLD-frame twist -> NED pose, FRD body velocity.
-        p, q = o.pose.pose.position, o.pose.pose.orientation
-        v, w = o.twist.twist.linear, o.twist.twist.angular
-        R_zup = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix()  # body FLU -> map
-        R = F @ R_zup @ F
-        nu = np.concatenate([F @ R_zup.T @ [v.x, v.y, v.z], F @ R_zup.T @ [w.x, w.y, w.z]])
-        pos = F @ [p.x, p.y, p.z]
-        x0 = jnp.asarray(np.concatenate([nu, pos, R.ravel()]), jnp.float32)
-
-        # INPUT: sonar ranges (body FLU, planar) -> fixed-size NED xy hit points within SCAN_RANGE;
-        # misses and far hits go far away (the grid covers those).
         obstacles = None
-        s = inbox["scan"]
-        if s is not None:
-            r = np.asarray(s.ranges[:SONAR_RAYS], np.float64)
-            a = s.angle_min + s.angle_increment * np.arange(len(r))
-            hit = np.isfinite(r) & (r >= s.range_min) & (r <= min(s.range_max, SCAN_RANGE))
-            body = np.stack([r * np.cos(a), r * np.sin(a), np.zeros_like(r)], -1)[hit]
-            pts = np.full((SONAR_RAYS, 2), 1e4)
-            pts[: hit.sum()] = (pos + (R @ F @ body.T).T)[:, :2]
-            obstacles = pts
+        if obs.scan is not None:  # fixed size: hits within SCAN_RANGE, the rest far away (grid covers it)
+            near = obs.scan[np.linalg.norm(obs.scan - obs.x[6:8], axis=-1) <= SCAN_RANGE][:SONAR_RAYS]
+            obstacles = np.full((SONAR_RAYS, 2), 1e4)
+            obstacles[: len(near)] = near
 
-        g = inbox["goal"]
-        goal = None if g is None else F @ [g.pose.position.x, g.pose.position.y, g.pose.position.z]
+        x0 = jnp.asarray(obs.x, jnp.float32)
+        ref = make_ref(obs.goal, obs.nominal, obstacles, self.grid)
+        u0, self.U, self.key, (positions, log_w) = mppi_step(self.U, self.key, x0, ref)
 
-        n = inbox["nominal"]
-        nominal = None
-        if n is not None and now() - inbox["nominal_t"] < NOMINAL_TIMEOUT:
-            nominal = [n.linear.x, -n.linear.y, -n.linear.z, -n.angular.z]  # FLU -> FRD
-
-        u0, U, key, vis = mppi_step(U, key, x0, make_ref(goal, nominal, obstacles, inbox["grid"]))
-
-        # OUTPUT: the first control as a wrench, and the velocity it produces as the sim command.
-        tau = np.asarray(u0)
-        msg = WrenchStamped()
-        msg.header.stamp = node.get_clock().now().to_msg()
-        msg.header.frame_id = "base_link"
-        msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z = map(float, tau[0:3])
-        msg.wrench.torque.x, msg.wrench.torque.y, msg.wrench.torque.z = map(float, tau[3:6])
-        control_pub.publish(msg)
-
-        nu_next = np.asarray(predict(x0, u0)[0:6])
-        cmd = Twist()
-        cmd.linear.x, cmd.linear.y, cmd.linear.z = float(nu_next[0]), float(-nu_next[1]), float(-nu_next[2])
-        cmd.angular.z = float(-nu_next[5])
-        cmd_vel_pub.publish(cmd)
-        publish_rollouts(vis)
-
-    node.create_timer(DT, on_timer)
-    try:
-        rclpy.spin(node)
-    except (KeyboardInterrupt, ExternalShutdownException):
-        pass
-    finally:
-        node.destroy_node()
-        if rclpy.ok():  # Ctrl-C already shut the context down
-            rclpy.shutdown()
+        log_w = np.asarray(log_w)
+        return ros_io.Command(
+            tau=np.asarray(u0),
+            nu_next=np.asarray(self.predict(x0, u0)[0:6]),
+            rollouts=np.asarray(positions),
+            scores=1.0 + (log_w - log_w.max()) / VIS_LOG_RANGE,
+        )
 
 
 def test():
@@ -387,4 +268,7 @@ if __name__ == "__main__":
     TEMPERATURE, NOISE_SIGMA = a.temperature, a.noise_sigma
     U_MIN, U_MAX = a.u_min, a.u_max
 
-    test() if a.mode == "test" else run_node()
+    if a.mode == "test":
+        test()
+    else:
+        ros_io.run(Controller(), DT, sinks=ros_io.marinegym_sinks(VEL_MAX), name="vanilla_mppi")

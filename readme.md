@@ -24,24 +24,12 @@ single self-contained file that runs as a node; swap in a different one here:
 source /opt/ros/jazzy/setup.bash && export PYTHONPATH=/opt/ros/jazzy/lib/python3.12/site-packages && (env -u GTK_PATH -u GIO_MODULE_DIR -u GTK_EXE_PREFIX -u LOCPATH -u GSETTINGS_SCHEMA_DIR -u GTK_IM_MODULE_FILE rviz2 -d fossen.rviz &) && uv run python modifiers/vanilla_mppi.py
 ```
 
-#### Closed loop with MarineGym (SimEnvBTUUV)
+#### Closed loop with MarineGym
 
-The MPPI reads the sim's telemetry topics and publishes a filtered body-velocity command that is bridged into the sim's UDP action port:
-
-```
-MarineGym --UDP:15010--> telemetry bridge --> /bluerov/odom, /bluerov/sonar/scan, /bluerov/map, /bluerov/goal --> vanilla_mppi
-MarineGym <--UDP:15000-- ros2_cmd_vel_to_udp.py <-- /fossen/modified_cmd_vel (Twist, body FLU) <-- vanilla_mppi
-```
-
-Optional: publish a pilot/policy command on `/fossen/nominal_cmd_vel` (Twist). While it is fresh, the MPPI tracks it and uses sonar to avoid obstacles. Otherwise it drives to `/bluerov/goal`. Run from `SimEnvBTUUV-main/`, one terminal each:
-
-```bash
-bash release/scripts/00_ros2_telemetry_bridge.sh     # sim -> ROS
-bash release/scripts/00_ros2_cmd_vel_bridge.sh       # ROS -> sim
-bash release/scripts/02_run_ext_ctrl_point_a_to_b.sh # sim, actions from UDP
-```
-
-then start `modifiers/vanilla_mppi.py` as above. `VEL_MAX` in the MPPI and `--u-max` etc. in the bridge must match `task.controller.{u,v,w,r}_max`.
+Run `./run.sh` from the parent repo. Controllers in `modifiers/` only map `ros_io.Observation -> ros_io.Command`;
+`ros_io.py` owns the ROS inputs, the output sinks (wrench, cmd_vel, rollout markers) and MarineGym's UDP action
+port (`{"action": [u, v, w, r]}`, body FLU / `VEL_MAX`, UDP:15000). Add an input/output there, not in a controller.
+`VEL_MAX` must match the sim's `task.controller.{u,v,w,r}_max`.
 
 More details: [docs/implementation_details.md](docs/implementation_details.md)
 
