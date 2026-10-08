@@ -24,7 +24,7 @@ import numpy as np
 
 F = np.diag([1.0, -1.0, -1.0])  # Z-up/FLU <-> NED/FRD, its own inverse
 
-# Topics of the MarineGym telemetry bridge (marine-gym-frl/scripts/ros2_udp_telemetry_publisher.py).
+# Topics of the MarineGym telemetry bridge (uuv-rl-env/scripts/ros2_udp_telemetry_publisher.py).
 STATE_TOPIC = "/bluerov/odom"              # nav_msgs/Odometry: pose in `map` (Z-up), twist in WORLD frame
 SONAR_TOPIC = "/bluerov/sonar/scan"        # sensor_msgs/LaserScan: planar, in bluerov_base_link (FLU)
 MAP_TOPIC = "/bluerov/map"                 # nav_msgs/OccupancyGrid: 2D, in `map`, 0..100
@@ -208,7 +208,7 @@ class RolloutsOut:
 
 class MarineGymUdp:
     """nu_next as MarineGym's physics input: UDP JSON {"action": [u, v, w, r]}, body FLU / vel_max,
-    clipped to [-1, 1]. Same packet as marine-gym-frl/scripts/ros2_joy_to_udp.py (action_mode=ros2_joy).
+    clipped to [-1, 1]. Same packet as uuv-rl-env/scripts/ros2_joy_to_udp.py (action_mode=ros2_joy).
     vel_max must match the sim's task.controller.{u,v,w,r}_max."""
 
     def __init__(self, node, vel_max, host="127.0.0.1", port=15000):

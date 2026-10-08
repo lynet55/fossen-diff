@@ -11,13 +11,13 @@ Current rule is, there is one common ros interface for subscribing and publishin
 
 #### Running the ros node
 
-Open rviz (from `fossen-diff/`). The `env -u` part is only needed in the VS Code snap terminal, where its GTK variables crash rviz2:
+Open rviz (from `uuv-diff/`). The `env -u` part is only needed in the VS Code snap terminal, where its GTK variables crash rviz2:
 
 ```bash
 source /opt/ros/jazzy/setup.bash && env -u GTK_PATH -u GIO_MODULE_DIR -u GTK_EXE_PREFIX -u LOCPATH -u GSETTINGS_SCHEMA_DIR -u GTK_IM_MODULE_FILE rviz2 -d fossen.rviz
 ```
 
-Run a filter node (from `fossen-diff/`), or start both at once. Each filter is a
+Run a filter node (from `uuv-diff/`), or start both at once. Each filter is a
 single self-contained file that runs as a node; swap in a different one here:
 
 ```bash
