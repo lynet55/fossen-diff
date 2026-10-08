@@ -635,7 +635,7 @@ wheels = [
 ]
 
 [[package]]
-name = "uuv-sim"
+name = "uuv-diff"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
